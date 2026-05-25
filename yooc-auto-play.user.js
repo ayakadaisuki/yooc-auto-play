@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         易班优课(YOOC)自动播放助手
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @description  自动播放YOOC课程视频，支持倍速播放，当前视频结束后自动播放下一节（兼容PC和移动端）
 // @author       Assistant
 // @match        *://xueyuan.yooc.me/courses/*/courseware/*
@@ -27,21 +27,31 @@
 
     // ============================================================
     //  1. 【关键】在 document-start 阶段立即拦截 nodrag()
-    //     原站通过 setInterval("nodrag()",100) 持续调用，
-    //     必须在它第一次执行前把 window.nodrag 替换为空函数，
-    //     否则倍速播放会被误判为"快进"而强制暂停。
+    //     原站 nodrag() 包含两部分功能：
+    //       a) 防快进检测（xc计算，倍速时会误判暂停）—— 需要禁用
+    //       b) 学习进度上报（85%/90%/95%时发送AJAX）—— 需要保留
+    //     因此用自定义函数替换，保留进度上报，去掉防快进
     // ============================================================
-    window.nodrag = function () { /* 已被 YOOC 助手禁用 */ };
 
-    // 同时拦截 setInterval 中的 nodrag 调用（备份措施）
+    // 保存原始 setInterval
     var _origSetInterval = window.setInterval;
-    window.setInterval = function (fn, delay) {
-        if (typeof fn === 'string' && fn.indexOf('nodrag') !== -1) {
-            // 返回一个假的 interval ID，不再实际执行
-            return 0;
-        }
-        return _origSetInterval.call(window, fn, delay);
+
+    // Cookie 读取工具函数
+    function getCookie(name) {
+        var match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+        return match ? decodeURIComponent(match[2]) : '';
+    }
+
+    // 替换 nodrag：只做进度上报，不做防快进
+    window.nodrag = function () {
+        // 此函数会被页面的 setInterval("nodrag()",100) 反复调用
+        // 我们不在这里做任何事，进度上报由脚本自己的逻辑处理
+        // （见下方 reportProgress 函数）
     };
+
+    // 拦截 setInterval 中的字符串形式 nodrag 调用
+    // 但我们仍然让它执行（因为我们已替换 nodrag 为空壳，只保留入口）
+    // 所以不再拦截，让原站的 setInterval("nodrag()",100) 正常触发我们替换后的函数
 
     // ============================================================
     //  2. 等待 DOM 就绪后注入 UI 和逻辑
@@ -285,12 +295,83 @@
                 }
             });
 
-            // 每秒保障倍速
+            // 每秒保障倍速 + 学习进度上报
+            var progressReported = { p85: false, p90: false, p95: false };
             _origSetInterval(function () {
+                // 保持倍速
                 if (video.playbackRate !== currentSpeed) {
                     video.playbackRate = currentSpeed;
                 }
+                // 学习进度上报（替代原站 nodrag 中被禁用的上报逻辑）
+                if (video.duration && video.currentTime) {
+                    var ratio = video.currentTime / video.duration;
+                    reportProgress(ratio, video, progressReported);
+                }
             }, 1000);
+        }
+
+        // ============================================================
+        //  学习进度上报函数
+        //  在 85%、90%、95% 三个节点向服务器发送 AJAX 请求
+        //  这是原站 nodrag()/countDone() 中的逻辑，防止禁用 nodrag 后丢失进度
+        // ============================================================
+        function reportProgress(ratio, video, reported) {
+            if (!reported.p85 && ratio > 0.85) {
+                sendDone(video);
+                reported.p85 = true;
+            }
+            if (!reported.p90 && ratio > 0.90) {
+                sendDone(video);
+                reported.p90 = true;
+            }
+            if (!reported.p95 && ratio > 0.95) {
+                sendDone(video);
+                reported.p95 = true;
+            }
+        }
+
+        function sendDone(video) {
+            // PC 端：视频元素上有 data-ajaxurl 属性
+            var ajaxUrl = (video && video.getAttribute('data-ajaxurl'))
+                // 移动端：隐藏 input #ajax_url
+                || (document.getElementById('ajax_url') && document.getElementById('ajax_url').value)
+                || '';
+            if (!ajaxUrl) return;
+
+            // CSRF token：多种来源尝试
+            var csrfToken = ''
+                // 1. 移动端隐藏 input
+                || (document.getElementById('csrf_token') && document.getElementById('csrf_token').value)
+                // 2. 任意 input[name="csrfmiddlewaretoken"]
+                || (document.querySelector('input[name="csrfmiddlewaretoken"]')
+                    && document.querySelector('input[name="csrfmiddlewaretoken"]').value)
+                // 3. meta 标签
+                || (document.querySelector('meta[name="csrf-token"]')
+                    && document.querySelector('meta[name="csrf-token"]').getAttribute('content'))
+                // 4. Django cookie
+                || getCookie('csrftoken')
+                || '';
+
+            // 将 token 也放入 URL（Django 某些版本需要）
+            if (csrfToken && ajaxUrl.indexOf('csrfmiddlewaretoken') === -1) {
+                var sep = ajaxUrl.indexOf('?') === -1 ? '?' : '&';
+                // 不放在URL里，放在POST body中即可
+            }
+
+            var data = new FormData();
+            data.append('csrfmiddlewaretoken', csrfToken);
+            data.append('saved_video_position', '00:00:01');
+            data.append('video_duration', '00:00:02');
+            data.append('done', 'true');
+
+            try {
+                var xhr = new XMLHttpRequest();
+                xhr.open('POST', ajaxUrl, true);
+                xhr.send(data);
+                console.log('[YOOC助手] 已上报学习进度');
+            } catch (e) {
+                console.warn('[YOOC助手] 进度上报失败:', e);
+            }
         }
 
         // ============================================================
